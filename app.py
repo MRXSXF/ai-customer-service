@@ -16,18 +16,22 @@ ENDPOINT = "http://localhost:11434/v1"
 FAKE_KEY = "ollama"
 TITLE_CAP = 20
 
+
 # 生成时间戳作为默认会话名
 def now_stamp():
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
 
 # 把文本整理成 Windows 合法文件名
 def safe_title(text):
     flat = re.sub(r"\s+", " ", str(text)).strip()
     return re.sub(r'[\\/:*?"<>|]', "-", flat)
 
+
 # 会话名对应到 JSON 存档路径
 def path_of(session):
     return os.path.join(WORKDIR, safe_title(session) + ".json")
+
 
 # 用首条用户消息命名新会话,重名追加时间后缀
 def derive_title(messages):
@@ -41,15 +45,18 @@ def derive_title(messages):
             return name
     return now_stamp()
 
+
 # 把当前会话写入存档
 def persist():
     os.makedirs(WORKDIR, exist_ok=True)
     payload = {
         "current_session": st.session_state.current_session,
+        "session_prompt": st.session_state.session_prompt,
         "messages": st.session_state.messages,
     }
     with open(path_of(st.session_state.current_session), "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
+
 
 # 列出全部已保存会话,新的在前
 def known_sessions():
@@ -60,25 +67,46 @@ def known_sessions():
         reverse=True,
     )
 
-# 加载指定会话到当前界面
-def restore(name):
+
+# 读取指定会话文件内容
+def read_session(name):
     target = path_of(name)
     if not os.path.exists(target):
-        st.warning(f"未找到会话:{name}")
-        return
+        return None, "文件不存在"
     try:
         with open(target, encoding="utf-8") as fh:
             blob = json.load(fh)
-        st.session_state.current_session = name
-        st.session_state.messages = blob.get("messages", [])
+        return blob, None
     except Exception as err:
-        st.error(f"会话读取失败:{err}")
+        return None, str(err)
+
+
+# 把某个会话设为当前会话(仅在控件创建前调用)
+def restore(name):
+    blob, err = read_session(name)
+    if err:
+        st.session_state.load_error = f"会话读取失败:{err}"
+        return
+    saved_prompt = blob.get("session_prompt")
+    if saved_prompt:
+        stored = load_presets()
+        if saved_prompt not in stored["prompts"]:
+            stored["prompts"].append(saved_prompt)
+            save_presets(stored)
+        st.session_state.active_prompt = saved_prompt
+        st.session_state.session_prompt = saved_prompt
+    else:
+        st.session_state.session_prompt = st.session_state.active_prompt
+    st.session_state.current_session = name
+    st.session_state.messages = blob.get("messages", [])
+
 
 # 删除指定会话的存档
 def drop_session(name):
     target = path_of(name)
     if os.path.exists(target):
         os.remove(target)
+
 
 # 读取预设,文件缺失或损坏时回落默认值
 def load_presets():
@@ -95,10 +123,12 @@ def load_presets():
     except Exception:
         return seed
 
+
 # 保存预设列表到文件
 def save_presets(data):
     with open(PRESET_FILE, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
+
 
 # 向预设追加一项(空值/重复忽略)
 def add_preset(kind, value, data):
@@ -107,11 +137,13 @@ def add_preset(kind, value, data):
         data[kind].append(value)
         save_presets(data)
 
+
 # 从预设移除一项(至少保留一个)
 def remove_preset(kind, value, data):
     if len(data[kind]) > 1 and value in data[kind]:
         data[kind].remove(value)
         save_presets(data)
+
 
 # 组装请求并调用 Ollama,返回流式响应
 def ask_model(model, system_prompt, history):
@@ -123,6 +155,7 @@ def ask_model(model, system_prompt, history):
         stream=True,
     )
 
+
 # 把流式响应拆成文本片段逐个产出
 def piece_text(stream):
     for chunk in stream:
@@ -132,9 +165,67 @@ def piece_text(stream):
         if delta and delta.content:
             yield delta.content
 
+
+# 下拉框变更处理:空对话直接采用;有内容则记录意图待弹窗确认
+def on_prompt_change():
+    chosen = st.session_state.active_prompt
+    if not st.session_state.messages:
+        st.session_state.session_prompt = chosen
+    else:
+        st.session_state.pending_prompt = chosen
+        st.session_state.show_dialog = True
+
+
+# 提示词变更确认弹窗
+@st.dialog("提示词变更")
+def prompt_switch_dialog(target_prompt):
+    st.write("所选提示词与当前对话不一致,是否用新提示词开始一段新对话?")
+    left, right = st.columns(2)
+    with left:
+        if st.button("新建对话", type="primary", width="stretch"):
+            st.session_state.prompt_action = "new"
+            st.session_state.target_prompt = target_prompt
+            st.rerun()
+    with right:
+        if st.button("取消", width="stretch"):
+            st.session_state.prompt_action = "cancel"
+            st.rerun()
+
+
+# 在当前轮次的控件创建前,统一处理上一轮记录下来的各种意图
+def apply_pending():
+    pending_load = st.session_state.pop("pending_load", None)
+    if pending_load:
+        restore(pending_load)
+
+    action = st.session_state.pop("prompt_action", None)
+    if action == "new":
+        if st.session_state.messages:
+            persist()
+        st.session_state.messages = []
+        st.session_state.current_session = now_stamp()
+        st.session_state.session_prompt = st.session_state.target_prompt
+        st.session_state.active_prompt = st.session_state.target_prompt
+        st.session_state.load_error = None
+    elif action == "cancel":
+        st.session_state.active_prompt = st.session_state.session_prompt
+
+    if "target_prompt" in st.session_state:
+        del st.session_state.target_prompt
+
+    next_prompt = st.session_state.pop("next_prompt", None)
+    if next_prompt:
+        st.session_state.active_prompt = next_prompt
+        if not st.session_state.messages:
+            st.session_state.session_prompt = next_prompt
+
+    if st.session_state.get("show_dialog") and st.session_state.get("pending_prompt"):
+        st.session_state.active_prompt = st.session_state.session_prompt
+
+
 st.set_page_config(
     page_title="AI智能客服",
-    page_icon=":robot_face:",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={},
@@ -144,6 +235,10 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "current_session" not in st.session_state:
     st.session_state.current_session = now_stamp()
+if "session_prompt" not in st.session_state:
+    st.session_state.session_prompt = st.session_state.get("active_prompt", "你是一个AI智能客服")
+
+apply_pending()
 
 presets = load_presets()
 model_options = presets["models"]
@@ -171,14 +266,15 @@ with st.sidebar:
         if len(model_options) > 1:
             if st.button("删除当前模型"):
                 remove_preset("models", st.session_state.active_model, presets)
-                st.session_state.active_model = load_presets()["models"][0]
+                st.session_state.next_model = load_presets()["models"][0]
                 st.rerun()
 
     st.divider()
 
     st.subheader("系统提示词")
-    st.session_state.active_prompt = st.selectbox(
-        "选择提示词", prompt_options, index=prompt_options.index(current_prompt)
+    st.selectbox(
+        "选择提示词", prompt_options, index=prompt_options.index(current_prompt),
+        key="active_prompt", on_change=on_prompt_change,
     )
     with st.expander("管理提示词"):
         new_prompt = st.text_area("新提示词", key="new_prompt", height=90)
@@ -188,7 +284,7 @@ with st.sidebar:
         if len(prompt_options) > 1:
             if st.button("删除当前提示词"):
                 remove_preset("prompts", st.session_state.active_prompt, presets)
-                st.session_state.active_prompt = load_presets()["prompts"][0]
+                st.session_state.next_prompt = load_presets()["prompts"][0]
                 st.rerun()
 
     st.divider()
@@ -198,6 +294,7 @@ with st.sidebar:
             persist()
         st.session_state.current_session = now_stamp()
         st.session_state.messages = []
+        st.session_state.session_prompt = st.session_state.active_prompt
         st.rerun()
 
     st.divider()
@@ -217,7 +314,7 @@ with st.sidebar:
                 key=f"load_{name}",
                 type="primary" if is_current else "secondary",
             ):
-                restore(name)
+                st.session_state.pending_load = name
                 st.rerun()
         with col_b:
             if st.button(
@@ -230,10 +327,20 @@ with st.sidebar:
                 if st.session_state.current_session == name:
                     st.session_state.current_session = now_stamp()
                     st.session_state.messages = []
+                    st.session_state.session_prompt = st.session_state.active_prompt
                 st.rerun()
+
+if st.session_state.pop("show_dialog", False):
+    prompt_switch_dialog(
+        st.session_state.pop("pending_prompt", st.session_state.session_prompt)
+    )
 
 st.title("AI智能客服")
 st.caption(st.session_state.active_model)
+
+error = st.session_state.pop("load_error", None)
+if error:
+    st.error(error)
 
 for item in st.session_state.messages:
     with st.chat_message(item["role"]):
@@ -249,7 +356,7 @@ if prompt:
     try:
         stream = ask_model(
             st.session_state.active_model,
-            st.session_state.active_prompt,
+            st.session_state.session_prompt,
             st.session_state.messages,
         )
         with st.chat_message("assistant"):
